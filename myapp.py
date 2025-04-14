@@ -29,11 +29,13 @@ else:
 os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
 os.environ["FFMPEG_BINARY"] = ffmpeg_path
 
-# Load credentials
-with open('project-alpha-456519-5c9ae36437f1.json') as f:
-    credentials_info = json.load(f)
-credentials = service_account.Credentials.from_service_account_info(credentials_info)
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "project-alpha-456519-5c9ae36437f1.json"
+# # Load credentials
+# with open('project-alpha-456519-5c9ae36437f1.json') as f:
+#     credentials_info = json.load(f)
+# credentials = service_account.Credentials.from_service_account_info(credentials_info)
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "project-alpha-456519-5c9ae36437f1.json"
+
+credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_credentials"])
 
 # Initialize clients
 vision_client = vision.ImageAnnotatorClient(credentials=credentials)
