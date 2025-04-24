@@ -71,7 +71,7 @@ TEMPLATED_API_URL = "https://api.templated.io/v1/renders"
 TEMPLATED_API_KEY = st.secrets["TEMPLATED_API_KEY"]
 TEMPLATED_TEMPLATE_ID = st.secrets["TEMPLATED_TEMPLATE_ID"]
 
-st.title("🎬 AI Video Analyzer with Semantic Search & Templated.io")
+st.title("🎬 AI Video Analyzer")
 
 # --- Helper Functions ---
 def get_video_duration(path):
