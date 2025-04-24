@@ -1,329 +1,767 @@
-import os
-import sys
-import time
-import tempfile
-import json
-from datetime import timedelta
-from concurrent.futures import ThreadPoolExecutor
-
-import cv2
-import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import VideoFileClip, AudioClip
-
-# Google Cloud libraries
-from google.cloud import videointelligence_v1 as vi
-from google.cloud import speech, vision
-from google.oauth2 import service_account
-
+import tempfile, os, shutil, time, subprocess, base64, requests
+import cv2
+from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+from moviepy import AudioFileClip, VideoFileClip, concatenate_videoclips
 import google.generativeai as genai
-import whisper
-from pytube import YouTube
+from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import videointelligence_v1 as vi, vision
+import boto3
+from openai import OpenAI
+from pinecone import Pinecone, ServerlessSpec
+import json
 
-# FFmpeg configuration (adjust path as needed)
-if sys.platform == "win32":
-    ffmpeg_path = "C:\\ffmpeg\\bin\\ffmpeg.exe"
-else:
-    ffmpeg_path = "ffmpeg"
-os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
-os.environ["FFMPEG_BINARY"] = ffmpeg_path
+from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
-# # Load credentials
-# with open('project-alpha-456519-5c9ae36437f1.json') as f:
-#     credentials_info = json.load(f)
-# credentials = service_account.Credentials.from_service_account_info(credentials_info)
-# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "project-alpha-456519-5c9ae36437f1.json"
+# --- Configuration & Clients ---
+# Google Cloud Setup
+google_credentials = st.secrets["google_cloud"]
+credentials_dict = {
+    "type": "service_account",
+    "project_id": google_credentials["project_id"],
+    "private_key_id": google_credentials["private_key_id"],
+    "private_key": google_credentials["private_key"].replace('\\n', '\n'),
+    "client_email": google_credentials["client_email"],
+    "client_id": google_credentials["client_id"],
+    "auth_uri": google_credentials["auth_uri"],
+    "token_uri": google_credentials["token_uri"],
+    "auth_provider_x509_cert_url": google_credentials["auth_provider_x509_cert_url"],
+    "client_x509_cert_url": google_credentials["client_x509_cert_url"]
+}
 
-credentials = service_account.Credentials.from_service_account_info(st.secrets["gcp_credentials"])
+with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as temp_file:
+    json.dump(credentials_dict, temp_file)
+    temp_file_path = temp_file.name
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file_path
 
-# Initialize clients
-vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-video_client = vi.VideoIntelligenceServiceClient(credentials=credentials)
-speech_client = speech.SpeechClient(credentials=credentials)
+# Initialize Clients
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+speech_client = speech.SpeechClient()
+vi_client = vi.VideoIntelligenceServiceClient()
+vision_client = vision.ImageAnnotatorClient()
+rekognition = boto3.client(
+    'rekognition',
+    aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+    aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
+    region_name="us-east-1"
+)
 
-# Configure Gemini (Generative AI)
-api_key = st.secrets["api"]["key"]
-genai.configure(api_key=api_key)
 
-# Load Whisper model
-@st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base")
 
-# Format seconds into HH:MM:SS
-def format_time(seconds):
-    return str(timedelta(seconds=seconds)).split(".")[0]
 
-# ---------------------------
-# Analysis with Video Intelligence API
-# ---------------------------
-def analyze_video(video_path):
-    client = vi.VideoIntelligenceServiceClient(credentials=credentials)
-    with open(video_path, "rb") as file:
-        input_content = file.read()
-    features = [
-        vi.Feature.LABEL_DETECTION,
-        vi.Feature.SHOT_CHANGE_DETECTION,
-        vi.Feature.SPEECH_TRANSCRIPTION
-    ]
-    # Configure speech transcription for Arabic (change as needed)
-    speech_config = vi.SpeechTranscriptionConfig(
-        language_code="ar-AE",
-        enable_automatic_punctuation=True
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+
+if "video-highlights" not in pc.list_indexes().names():
+    pc.create_index(
+        name="video-highlights",
+        dimension=1536,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
     )
-    video_context = vi.VideoContext(speech_transcription_config=speech_config)
-    
-    operation = client.annotate_video(
-        request={
-            "features": features,
-            "input_content": input_content,
-            "video_context": video_context
-        }
-    )
-    st.info("Google Cloud is processing the video. Please wait...")
-    result = operation.result(timeout=300)
-    annotation_result = result.annotation_results[0]
-    
-    # --- Scene detection using shot annotations ---
-    scenes = []
-    if annotation_result.shot_annotations:
-        for shot in annotation_result.shot_annotations:
-            start_time = shot.start_time_offset.total_seconds()
-            end_time = shot.end_time_offset.total_seconds()
-            scenes.append({
-                "start": start_time,
-                "end": end_time,
-                "duration": end_time - start_time,
-                "labels": []
-            })
-    # Fallback: if no shot annotations, use whole video duration.
-    if not scenes:
-        with VideoFileClip(video_path) as clip:
-            total_duration = clip.duration
-        scenes = [{
-            "start": 0,
-            "end": total_duration,
-            "duration": total_duration,
-            "labels": []
-        }]
-        st.warning("No distinct scenes detected; using full video as one scene.")
-    
-    # --- Label detection ---
-    overall_labels = set()
-    if annotation_result.segment_label_annotations:
-        for label in annotation_result.segment_label_annotations:
-            for segment in label.segments:
-                seg_start = segment.segment.start_time_offset.total_seconds()
-                seg_end = segment.segment.end_time_offset.total_seconds()
-                for scene in scenes:
-                    # If the detected segment lies entirely within a scene, add the label.
-                    if seg_start >= scene["start"] and seg_end <= scene["end"]:
-                        scene["labels"].append(label.entity.description)
-                        overall_labels.add(label.entity.description)
-    
-    # --- Speech transcription ---
-    transcript_overall = ""
-    if annotation_result.speech_transcriptions:
-        for transcription in annotation_result.speech_transcriptions:
-            if transcription.alternatives:
-                transcript_overall += transcription.alternatives[0].transcript + " "
-    
-    return {
-        "transcript": transcript_overall.strip(),
-        "scenes": scenes,
-        "labels": list(overall_labels)
-    }
 
-# ---------------------------
-# Automatic Highlight Creation
-# ---------------------------
-def generate_highlight(video_path, scenes, duration=30):
+index = pc.Index("video-highlights")
+
+
+
+
+
+# Templated.io Config
+TEMPLATED_API_URL = "https://api.templated.io/v1/renders"
+TEMPLATED_API_KEY = st.secrets["TEMPLATED_API_KEY"]
+TEMPLATED_TEMPLATE_ID = st.secrets["TEMPLATED_TEMPLATE_ID"]
+
+st.title("🎬 AI Video Analyzer with Semantic Search & Templated.io")
+
+# --- Helper Functions ---
+def get_video_duration(path):
+    clip = VideoFileClip(path)
+    duration = clip.duration
+    clip.close()
+    return duration
+
+def save_temp_video(uploaded):
+    temp_dir = tempfile.mkdtemp()
+    path = os.path.join(temp_dir, uploaded.name)
+    with open(path, "wb") as f:
+        f.write(uploaded.read())
+    return path, temp_dir
+
+
+
+# def transcribe(path, chunk_length=59, overlap=0.5):
+#     """
+#     If clip ≤ chunk_length, do one shot; otherwise split into
+#     overlapping chunks ≤59 s, filter out empty results, and
+#     return ONE full transcript string.
+#     """
+#     base, _ = os.path.splitext(path)
+#     clip = AudioFileClip(path)
+#     duration = clip.duration
+#     client = speech.SpeechClient()
+#     transcripts = []
+
+#     def _transcribe_segment(start, end):
+#         fn = f"{base}_chunk_{int(start*1000)}.wav"
+#         clip.subclipped(start, end).write_audiofile(
+#             fn, fps=16000, ffmpeg_params=["-ac", "1"], logger=None
+#         )
+#         with open(fn, "rb") as f:
+#             audio = speech.RecognitionAudio(content=f.read())
+#         os.remove(fn)
+
+#         best = ""
+#         for lang in ("en-US", "ar", "ur"):
+#             cfg = speech.RecognitionConfig(
+#                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+#                 sample_rate_hertz=16000,
+#                 language_code=lang,
+#                 enable_automatic_punctuation=True
+#             )
+#             try:
+#                 resp = client.recognize(config=cfg, audio=audio)
+#                 text = " ".join(r.alternatives[0].transcript for r in resp.results)
+#                 if len(text) > len(best):
+#                     best = text
+#             except Exception:
+#                 continue
+#         return best.strip()
+
+#     if duration <= chunk_length:
+#         transcripts.append(_transcribe_segment(0, duration))
+#     else:
+#         start = 0.0
+#         while start < duration:
+#             end = min(start + chunk_length, duration)
+#             transcripts.append(_transcribe_segment(start, end))
+#             start += chunk_length - overlap
+#             time.sleep(0.2)
+
+#     # drop any empty strings before joining
+#     filtered = [t for t in transcripts if t]
+#     return " ".join(filtered)
+
+
+
+def transcribe(path, chunk_length=59, overlap=0.5):
     """
-    Automatically generate a highlight clip from the video.
-    The selection heuristic here is simply choosing the longest scene.
-    The clip length is trimmed to at most `duration` seconds.
+    Splits audio into overlapping chunks, transcribes each in multiple languages,
+    and returns both full text and per-chunk transcripts with timestamps.
     """
-    if not scenes:
-        st.error("No scenes detected to generate highlight.")
-        return None
+    base, _ = os.path.splitext(path)
+    clip = AudioFileClip(path)
+    duration = clip.duration
+    transcripts = []
 
-    # Select the scene with maximum duration.
-    selected_scene = max(scenes, key=lambda s: s["duration"])
-    start, end = selected_scene["start"], selected_scene["end"]
-    if (end - start) > duration:
-        end = start + duration
-
-    with VideoFileClip(video_path) as clip:
-        subclip = clip.subclip(start, end)
-        # Ensure clip has audio; if missing, provide silent audio.
-        if not subclip.audio:
-            audio = AudioClip(lambda t: [0, 0], duration=subclip.duration)
-            subclip = subclip.set_audio(audio)
-        highlight_path = os.path.join(tempfile.gettempdir(), "highlight.mp4")
-        subclip.write_videofile(
-            highlight_path,
-            codec="libx264",
-            audio_codec="aac",
-            ffmpeg_params=["-ar", "16000"],
-            logger=None  # reduce verbosity
+    def _transcribe_segment(start, end):
+        fn = f"{base}_chunk_{int(start*1000)}.wav"
+        clip.subclipped(start, end).write_audiofile(
+            fn, fps=16000, ffmpeg_params=["-ac", "1"], logger=None
         )
-    return highlight_path
+        with open(fn, "rb") as f:
+            audio = speech.RecognitionAudio(content=f.read())
+        os.remove(fn)
 
-# ---------------------------
-# Banner & Thumbnail Generation
-# ---------------------------
-def generate_banner(video_path, summary_text):
-    """
-    Generate a banner using a key frame (from the midpoint of the video)
-    with the summary text overlaid.
-    """
+        best = ""
+        for lang in ("en-US", "ar", "ur"):
+            cfg = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=16000,
+                language_code=lang,
+                enable_automatic_punctuation=True
+            )
+            try:
+                resp = speech_client.recognize(config=cfg, audio=audio)
+                text = " ".join(r.alternatives[0].transcript for r in resp.results)
+                if len(text) > len(best):
+                    best = text
+            except Exception:
+                continue
+        return best.strip()
+
+    if duration <= chunk_length:
+        text = _transcribe_segment(0, duration)
+        transcripts.append({"start": 0, "end": duration, "text": text})
+    else:
+        start = 0.0
+        while start < duration:
+            end = min(start + chunk_length, duration)
+            text = _transcribe_segment(start, end)
+            transcripts.append({"start": start, "end": end, "text": text})
+            start += chunk_length - overlap
+            time.sleep(0.2)
+
+    # filter out empty
+    segments = [s for s in transcripts if s["text"]]
+    full_text = " ".join(s["text"] for s in segments)
+    return full_text, segments
+
+
+
+def analyze_frame(image_bytes):
+    labels = []
     try:
-        with VideoFileClip(video_path) as clip:
-            middle = clip.duration / 2
-            frame = clip.get_frame(middle)
+        # AWS Rekognition
+        aws_labels = rekognition.detect_labels(Image={"Bytes": image_bytes}, MaxLabels=15)
+        labels += [l["Name"] for l in aws_labels.get("Labels", [])]
         
-        # Convert frame from BGR (OpenCV) to RGB.
-        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(img)
-        try:
-            # Use a TTF font if available.
-            font = ImageFont.truetype("arial.ttf", 30)
-        except Exception as fe:
-            font = ImageFont.load_default()
+        # Celebrity Recognition
+        celebs = rekognition.recognize_celebrities(Image={"Bytes": image_bytes})
+        labels += [c["Name"] for c in celebs.get("CelebrityFaces", [])]
         
-        # Wrap text every 40 characters for better readability.
-        wrapped_text = "\n".join([summary_text[i:i+40] for i in range(0, len(summary_text), 40)])
-        draw.text((10, 10), wrapped_text, fill="white", font=font, stroke_width=2, stroke_fill="black")
-        banner_path = os.path.join(tempfile.gettempdir(), "banner.jpg")
-        img.save(banner_path)
-        return banner_path
+        # Google Vision
+        gimg = vision.Image(content=image_bytes)
+        gv_labels = vision_client.label_detection(image=gimg)
+        labels += [l.description for l in gv_labels.label_annotations]
+        
     except Exception as e:
-        st.error(f"Banner generation failed: {str(e)}")
-        return None
-
-# ---------------------------
-# Whisper Transcription
-# ---------------------------
-@st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base")
-
-def whisper_transcribe(video_path):
-    model = load_whisper_model()
-    result = model.transcribe(video_path, language="ar")
-    return result["text"]
-
-# ---------------------------
-# Translation & Summarization with Gemini
-# ---------------------------
-def translate_text(text):
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    response = model.generate_content(f"Translate to English: {text}")
-    return response.text
-
-def summarize_with_gemini(translated_text, labels):
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    label_description = ", ".join(labels)
-    prompt = f"""
-    Given the following video description and transcript, generate a detailed and coherent summary of what the video is about.
-
-    Video Description (based on detected content): {label_description}
-
-    Transcript: {translated_text}
-    """
-    response = model.generate_content(prompt)
-    return response.text
-
-# ---------------------------
-# Main Application
-# ---------------------------
-def main():
-    st.set_page_config(layout="wide", page_title="Arabic Video Analyzer with Cloud Vision")
-    st.title("📹 Arabic Video Analysis Platform")
-
-    video_file = st.file_uploader("Upload Arabic Video", type=["mp4", "mov"])
-    youtube_url = st.text_input("Or Enter YouTube URL")
-
-    video_path = None
-    if youtube_url:
-        try:
-            yt = YouTube(youtube_url)
-            stream = yt.streams.filter(progressive=True, file_extension='mp4').first()
-            video_path = stream.download(output_path=tempfile.gettempdir())
-            st.success("YouTube video downloaded!")
-        except Exception as e:
-            st.error(f"YouTube Error: {str(e)}")
+        st.error(f"Analysis error: {str(e)}")
     
-    if video_file:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
-            tmp_file.write(video_file.read())
-            video_path = tmp_file.name
+    return list(dict.fromkeys(labels))[:20]
 
-    if video_path:
-        st.video(video_path)
+# def enrich_shots(path):
+#     # Detect scene changes
+#     with open(path, "rb") as f:
+#         content = f.read()
+#     req = vi.AnnotateVideoRequest(
+#         input_content=content,
+#         features=[vi.Feature.SHOT_CHANGE_DETECTION]
+#     )
+#     op = vi_client.annotate_video(request=req)
+#     shots = op.result(timeout=300).annotation_results[0].shot_annotations
+
+#     records = []
+#     for shot in shots:
+#         start = shot.start_time_offset.total_seconds()
+#         end = shot.end_time_offset.total_seconds()
+        
+#         # Analyze 3 frames per scene
+#         labels = set()
+#         for t in [start + (end-start)*i/3 for i in (0, 1, 2)]:
+#             frame_path = save_frame(path, t, f"frame_{t}.jpg")
+#             with open(frame_path, "rb") as f:
+#                 labels.update(analyze_frame(f.read()))
+#             os.remove(frame_path)
+        
+#         # Generate scene summary
+#         try:
+#             resp = client.chat.completions.create(
+#                 model="gpt-4-turbo",
+#                 messages=[{
+#                     "role": "system",
+#                     "content": "Summarize this video scene considering visual elements, possible activities, emotions, and context. Focus on creating rich metadata for search."
+#                 }, {
+#                     "role": "user",
+#                     "content": f"Detected elements: {', '.join(labels)}"
+#                 }],
+#                 temperature=0.7,
+#                 max_tokens=150
+#             )
+#             summary = resp.choices[0].message.content.strip()
+#         except Exception as e:
+#             summary = "Scene analysis unavailable"
+#             st.error(f"GPT-4 error: {str(e)}")
+        
+#         records.append({
+#             "start": start,
+#             "end": end,
+#             "labels": list(labels),
+#             "summary": summary
+#         })
+    
+#     return records
+
+
+def enrich_shots(path, transcript_segments):
+    """
+    Detects shot changes, analyzes frames, and generates LLM summaries including
+    both labels and the transcript for that scene.
+    """
+    with open(path, "rb") as f:
+        content = f.read()
+    req = vi.AnnotateVideoRequest(
+        input_content=content,
+        features=[vi.Feature.SHOT_CHANGE_DETECTION]
+    )
+    op = vi_client.annotate_video(request=req)
+    shots = op.result(timeout=300).annotation_results[0].shot_annotations
+
+    records = []
+    for shot in shots:
+        start = shot.start_time_offset.total_seconds()
+        end = shot.end_time_offset.total_seconds()
+        labels = set()
+        # analyze frames
+        for t in [start + (end - start) * i / 3 for i in (0, 1, 2)]:
+            frame_path = save_frame(path, t, f"frame_{t}.jpg")
+            with open(frame_path, "rb") as f:
+                labels.update(analyze_frame(f.read()))
+            os.remove(frame_path)
+
+        # extract transcript for this scene
+        scene_text = " ".join(
+            seg["text"] for seg in transcript_segments
+            if seg["start"] < end and seg["end"] > start
+        )
+
+        # Generate scene summary with transcript context
         try:
-            with VideoFileClip(video_path) as clip:
-                duration = clip.duration
-            st.caption(f"Duration: {format_time(duration)}")
-        except:
-            st.caption("Unable to determine video duration.")
+            resp = client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[
+                    {"role": "system", "content": (
+                        "Summarize this video scene considering visual elements, "
+                        "possible activities, emotions, and context. Use the transcript to enrich accuracy."
+                    )},
+                    {"role": "user", "content": (
+                        f"Detected elements: {', '.join(labels)}\n"
+                        f"Transcript excerpt: {scene_text if scene_text else '[No speech]'}"
+                    )}
+                ],
+                temperature=0.7,
+                max_tokens=150
+            )
+            summary = resp.choices[0].message.content.strip()
+        except Exception as e:
+            summary = "Scene analysis unavailable"
+            st.error(f"GPT-4 error: {str(e)}")
 
-        if st.button("Analyze Video"):
-            with st.spinner("Analyzing with Google Cloud, Whisper, and Gemini..."):
-                try:
-                    # 1. Google Cloud Video Intelligence Analysis (labels, scenes, transcripts)
-                    analysis = analyze_video(video_path)
-                    
-                    # 2. Whisper-based transcription
-                    whisper_text = whisper_transcribe(video_path)
-                    
-                    # 3. Combine transcripts (from Cloud and Whisper)
-                    full_transcript = analysis["transcript"] + "\n\n" + whisper_text
-                    
-                    # 4. Translate combined transcript to English using Gemini.
-                    translated = translate_text(full_transcript)
-                    
-                    # 5. Summarize based on translated transcript and detected labels.
-                    summary = summarize_with_gemini(translated, analysis["labels"])
-                    
-                    scenes = analysis["scenes"]
-                    
-                    # Create tabs for different results.
-                    tab1, tab2, tab3, tab4 = st.tabs(["Transcript", "Scenes", "Highlights", "Report"])
-                    
-                    with tab1:
-                        st.subheader("Arabic Transcript")
-                        st.write(full_transcript)
-                        st.subheader("English Translation")
-                        st.write(translated)
-                        st.subheader("Summary")
-                        st.write(summary)
-                    
-                    with tab2:
-                        st.subheader("Detected Scenes")
-                        for idx, scene in enumerate(scenes):
-                            with st.expander(f"Scene {idx+1}: {format_time(scene['start'])} - {format_time(scene['end'])}"):
-                                st.write("**Duration:**", f"{scene['duration']:.1f} seconds")
-                                st.write("**Labels:**", ", ".join(set(scene["labels"])))
-                    
-                    with tab3:
-                        st.subheader("Automatic Highlight Clip")
-                        highlight_path = generate_highlight(video_path, scenes, duration=30)
-                        if highlight_path:
-                            st.video(highlight_path)
-                    
-                    with tab4:
-                        st.subheader("Banner & Technical Report")
-                        banner_path = generate_banner(video_path, summary)
-                        if banner_path:
-                            st.image(banner_path)
-                    
-                except Exception as e:
-                    st.error(f"Processing Error: {str(e)}")
-                finally:
-                    if os.path.exists(video_path):
-                        os.remove(video_path)
+        records.append({
+            "start": start,
+            "end": end,
+            "labels": list(labels),
+            "summary": summary
+        })
 
-if __name__ == "__main__":
-    main()
+    return records
+
+
+
+def save_frame(path, t, outp):
+    cap = cv2.VideoCapture(path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+    ret, frame = cap.read()
+    if ret:
+        cv2.imwrite(outp, frame)
+    cap.release()
+    return outp
+
+def index_scenes(scenes):
+    vectors = []
+    for i, scene in enumerate(scenes):
+        text = f"{scene['summary']} {' '.join(scene['labels'])}"
+        emb = client.embeddings.create(input=[text], model="text-embedding-ada-002")
+        vectors.append((str(i), emb.data[0].embedding, scene))
+    index.upsert(vectors=vectors)
+
+
+
+### FUll summary 
+## Summerizing scenes in chunks
+def summarize_chunks_with_gemini(summaries, chunk_size=5):
+    chunk_summaries = []
+    system_prompt = (
+        "You are a video summarization assistant. "
+        "Condense the following scene summaries into a concise paragraph (80-100 words) maintaining key persons, events, main message, key agenda and insights."
+    )
+    for i in range(0, len(summaries), chunk_size):
+        chunk = summaries[i:i+chunk_size]
+        prompt = system_prompt + "\n\n" + "\n".join(f"- {s}" for s in chunk)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_content(prompt)
+        chunk_summaries.append(resp.text.strip())
+        time.sleep(1)
+    return chunk_summaries
+
+
+### final full summary 
+def final_summary_with_openai(chunk_summaries):
+    system_msg = "You are a professional video summarization expert. "
+    user_msg = (
+        "Combine these chunk summaries into a cohesive, comprehensive summary of the entire video in 250-300 words, "
+        "highlighting main themes, narrative flow, and key takeaways.\n\n" +
+        "\n".join(f"- {s}" for s in chunk_summaries)
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ],
+        max_tokens=800,
+        temperature=0.7
+    )
+    return resp.choices[0].message.content.strip()
+
+
+
+def semantic_search(prompt, top_k=3):
+    emb = client.embeddings.create(input=[prompt], model="text-embedding-ada-002")
+    return index.query(
+        vector=emb.data[0].embedding,
+        top_k=top_k,
+        include_metadata=True
+    )
+                                        ######## added this one as well
+def index_scenes(scenes):
+    # delete any old vectors so IDs always line up 0…len(scenes)-1
+    index.delete(delete_all=True)
+    vectors = []
+    for i, scene in enumerate(scenes):
+        text = f"{scene['summary']} {' '.join(scene['labels'])}"
+        emb = client.embeddings.create(input=[text], model="text-embedding-ada-002")
+        vectors.append((str(i), emb.data[0].embedding, scene))
+    index.upsert(vectors=vectors)
+
+def create_templated_thumbnail(frame_path, title, summary):
+    with open(frame_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+    
+    payload = {
+        "template_id": TEMPLATED_TEMPLATE_ID,
+        "modifications": {
+            "title": {"text": title},
+            "summary": {"text": summary},
+            "image": {"image_data": img_b64}
+        }
+    }
+    headers = {"Authorization": f"Bearer {TEMPLATED_API_KEY}"}
+    resp = requests.post(TEMPLATED_API_URL, json=payload, headers=headers)
+    return resp.json().get("url")
+
+# --- UI Flow ---
+st.session_state.setdefault("uploaded", None)
+st.session_state.setdefault("transcript", "")
+st.session_state.setdefault("chunk_transcripts", [])
+st.session_state.setdefault("scenes", [])
+st.session_state.setdefault("video_title", "")
+if 'scene_records' not in st.session_state:
+    st.session_state['scene_records'] = []
+
+uploaded = st.file_uploader("Upload video (MP4, MOV, AVI)", type=["mp4", "mov", "avi"])
+if uploaded:
+    video_path, temp_dir = save_temp_video(uploaded)
+    duration = get_video_duration(video_path)
+    st.session_state.uploaded = video_path
+    
+    # if st.button("1️⃣ Transcribe Video"):
+    #     st.session_state.transcript = transcribe(st.session_state.uploaded)
+
+    if st.button("1️⃣ Transcribe Video"):
+        full, segments = transcribe(st.session_state.uploaded)
+        st.session_state.transcript = full
+        st.session_state.chunk_transcripts = segments
+
+    
+
+
+
+    if duration > 240:  # 4 minutes
+        st.warning("Note: Full analysis limited to first 4 minutes for free tier services")
+
+    # --- Processing Buttons ---
+    col1, col2 = st.columns(2)
+    with col1:
+        # if st.button("✨ Analyze Scenes"):
+        #     with st.spinner("Detecting scenes and analyzing content..."):
+        #         st.session_state.scenes = enrich_shots(video_path)
+        #         index_scenes(st.session_state.scenes)
+
+
+        # if st.button("✨ Analyze Scenes"):
+        #     with st.spinner("Detecting scenes and analyzing content..."):
+        #         st.session_state.scenes = enrich_shots(
+        #             st.session_state.uploaded,
+        #             st.session_state.chunk_transcripts
+        #         )
+        #         index_scenes(st.session_state.scenes)
+
+
+        if st.button("✨ Analyze Scenes"):
+            with st.spinner():
+                # transcript already in state
+                shots = enrich_shots(video_path, st.session_state.chunk_transcripts)
+                st.session_state.scenes = shots
+                index_scenes(shots)
+                st.session_state['scene_records'] = shots
+                st.success(f"Generated {len(shots)} scene records.")
+
+
+    # with col2:
+    #     if st.button("🎨 Generate Title"):
+    #         summaries = [s["summary"] for s in st.session_state.scenes[:3]]
+    #         prompt = f"Create a catchy 3-5 word title based on these scenes: {summaries}"
+    #         response = client.chat.completions.create(
+    #             model="gpt-4",
+    #             messages=[{"role": "user", "content": prompt}],
+    #             temperature=0.7
+    #         )
+    #         st.session_state.video_title = response.choices[0].message.content.strip()
+
+
+
+    # Modify the tab setup
+    tab0, tab1, tab6, tab2, tab5, tab3, tab4,  = st.tabs([
+        "Transcription" , "Scene Breakdown", "Full video summary", "Semantic Search", 
+        "Promo Clip", "Banner Creator",  "Raw Content" 
+    ])
+
+    st.session_state.setdefault("selected_scenes", [])
+
+
+    with tab0:
+        st.header("Full Transcript")
+        if st.session_state.transcript:
+            st.text_area(
+                "Combined Transcript",
+                value=st.session_state.transcript,
+                height=300
+            )
+        else:
+            st.info("Click **Transcribe Video** first.")
+
+
+
+    with tab1:  # Scene Breakdown
+        if st.session_state.scenes:
+            st.subheader("📽️ Scene Analysis")
+            for i, scene in enumerate(st.session_state.scenes):
+                with st.expander(f"Scene {i+1} ({scene['start']:.1f}s - {scene['end']:.1f}s)"):
+                    col1, col2 = st.columns([1, 3])
+                    with col1:
+                        frame_path = save_frame(video_path, scene["start"], f"scene_{i}.jpg")
+                        st.image(frame_path, width=200)
+                    with col2:
+                        st.write(f"**Detected Elements:** {', '.join(scene['labels'][:15])}")
+                        st.write(f"**AI Summary:** {scene['summary']}")
+        else:
+            st.info("Click 'Analyze Scenes' to process video content")
+
+
+    with tab2:
+        st.subheader("🔍 Find Moments by Description")
+        query = st.text_input("Describe the moment you want to find:", 
+                            placeholder="e.g., 'emotional speech', 'action sequence', 'beautiful landscape'")
+        
+        if query and st.session_state.scenes:
+            results = semantic_search(query)
+            st.subheader("Top Matching Scenes")
+            
+            # Reset selection when new search
+            if query != st.session_state.get("last_query", ""):
+                st.session_state.selected_scenes = []
+            st.session_state.last_query = query
+            
+            for i, match in enumerate(results["matches"]):
+                scene_idx = int(match["id"])
+                if 0 <= scene_idx < len(st.session_state.scenes):
+                    scene = st.session_state.scenes[scene_idx]
+                else:
+                    continue 
+
+                scene = st.session_state.scenes[scene_idx]
+                
+                col1, col2 = st.columns([1, 4])
+                with col1:
+                    frame_path = save_frame(video_path, scene["start"], f"match_{i}.jpg")
+                    st.image(frame_path, caption=f"{scene['end']-scene['start']:.1f}s scene")
+                with col2:
+                    # Add checkbox
+                    selected = st.checkbox(
+                        f"Select this scene (Score: {match['score']:.2f})",
+                        value=scene_idx in st.session_state.selected_scenes,
+                        key=f"select_{i}"
+                    )
+                    
+                    if selected and scene_idx not in st.session_state.selected_scenes:
+                        st.session_state.selected_scenes.append(scene_idx)
+                    elif not selected and scene_idx in st.session_state.selected_scenes:
+                        st.session_state.selected_scenes.remove(scene_idx)
+                    
+                    st.write(f"**Time:** {scene['start']:.1f}s - {scene['end']:.1f}s")
+                    st.write(f"**Summary:** {scene['summary']}")
+                    st.write(f"**Labels:** {', '.join(scene['labels'][:10])}")
+
+
+    with tab3:  # Banner Creator
+        # if st.session_state.scenes:
+        #     st.subheader("🖼️ Generate Social Media Assets")
+        #     selected_scene = st.selectbox(
+        #         "Choose scene for banner",
+        #         st.session_state.scenes,
+        #         format_func=lambda x: f"{x['start']:.1f}s - {x['end']:.1f}s"
+        #     )
+            
+        #     if selected_scene and st.button("Generate Banner"):
+        #         frame_path = save_frame(video_path, selected_scene["start"], "banner_frame.jpg")
+        #         thumbnail_url = create_templated_thumbnail(
+        #             frame_path,
+        #             st.session_state.video_title,
+        #             selected_scene["summary"]
+        #         )
+                
+        #         st.image(thumbnail_url, caption="Generated Banner")
+        #         img_data = requests.get(thumbnail_url).content
+        #         st.download_button(
+        #             "Download Banner",
+        #             data=img_data,
+        #             file_name="video_banner.jpg",
+        #             mime="image/jpeg"
+        #         )
+
+
+        # if st.button("🤖 Auto-Generate Banner"):
+        # # 1) make sure we have scenes
+        #     scenes = st.session_state.scenes
+        #     if not scenes:
+        #         st.error("⚠️ Run Scene Analysis first!")
+        #     else:
+        #         # 2) semantic search for “best” scene
+        #         results = semantic_search(
+        #             "Which scene is the most engaging for a social-media banner?",
+        #             top_k=1
+        #         )
+        #         matches = results.get("matches", [])
+        #         if not matches:
+        #             st.error("😕 Couldn't find any matching scene. Try re-analyzing or use a different prompt.")
+        #         else:
+        #             # 3) safely parse index and verify it’s in range
+        #             idx = int(matches[0]["id"])
+        #             if idx < 0 or idx >= len(scenes):
+        #                 st.error(f"⚠️ Scene index {idx} out of range (0–{len(scenes)-1})")
+        #             else:
+        #                 scene = scenes[idx]
+
+        #                 # 4) generate title
+        #                 prompt = f"Create a catchy 3–5 word title for this scene: {scene['summary']}"
+        #                 resp = client.chat.completions.create(
+        #                     model="gpt-4",
+        #                     messages=[{"role":"user","content":prompt}],
+        #                     temperature=0.7
+        #                 )
+        #                 title = resp.choices[0].message.content.strip()
+
+        #                 # 5) grab the key frame
+        #                 frame = save_frame(st.session_state.uploaded, scene["start"], "auto_frame.jpg")
+
+        #                 # 6) call templated.io
+        #                 thumb_url = create_templated_thumbnail(frame, title, scene["summary"])
+
+        #                 # 7) display & download
+        #                 st.image(thumb_url, caption=title)
+        #                 st.download_button(
+        #                     "Download Banner",
+        #                     data=requests.get(thumb_url).content,
+        #                     file_name="banner.jpg",
+        #                     mime="image/jpeg"
+        #                 )
+
+
+
+        if st.button("🤖 Auto-Generate Banner"):
+            scenes = st.session_state.scenes
+            if not scenes:
+                st.error("⚠️ Run Scene Analysis first!")
+            else:
+                # 1) semantic search for “best” scene, get 3 so we can filter
+                results = semantic_search(
+                    "Which scene is the most engaging for a social-media banner?",
+                    top_k=3
+                )
+                matches = results.get("matches", [])
+                
+                # 2) drop any match whose ID is outside 0…len(scenes)-1
+                valid = [
+                    m for m in matches
+                    if m.get("id", "").isdigit()
+                    and 0 <= int(m["id"]) < len(scenes)
+                ]
+                if not valid:
+                    st.error("😕 No valid scene found—try re-analyzing or tweak the prompt.")
+                else:
+                    # 3) pick top‐scoring valid match
+                    best = valid[0]
+                    idx = int(best["id"])
+                    scene = scenes[idx]
+
+                    # 4) generate a 3–5 word title
+                    prompt = f"Create a catchy 3–5 word title for this scene: {scene['summary']}"
+                    resp = client.chat.completions.create(
+                        model="gpt-4",
+                        messages=[{"role":"user","content":prompt}],
+                        temperature=0.7
+                    )
+                    title = resp.choices[0].message.content.strip()
+
+                    # 5) grab the key frame
+                    frame = save_frame(st.session_state.uploaded, scene["start"], "auto_frame.jpg")
+
+                    # 6) call templated.io to build the banner
+                    thumb_url = create_templated_thumbnail(frame, title, scene["summary"])
+
+                    # 7) display & download
+                    st.image(thumb_url, caption=title)
+                    st.download_button(
+                        "Download Banner",
+                        data=requests.get(thumb_url).content,
+                        file_name="banner.jpg",
+                        mime="image/jpeg"
+                    )
+
+
+    with tab4:  # Raw Content
+        if st.session_state.scenes:
+            st.download_button(
+                "📥 Download Scene Analysis (JSON)",
+                data=json.dumps(st.session_state.scenes, indent=2),
+                file_name="video_analysis.json"
+            )
+
+
+
+    # New Promo Clip tab
+    with tab5:
+        if st.session_state.selected_scenes:
+            st.subheader("🎥 Compile Selected Scenes into Promo")
+            if st.button("Generate Promo"):
+                with st.spinner("Rendering promo clip..."):
+                    clips = []
+                    for idx in st.session_state.selected_scenes:
+                        scene = st.session_state.scenes[idx]
+                        clip = VideoFileClip(video_path).subclipped(scene['start'], scene['end'])
+                        clips.append(clip)
+                    promo = concatenate_videoclips(clips)
+                    out_path = os.path.join(temp_dir, "promo_clip.mp4")
+                    promo.write_videofile(out_path, codec="libx264", audio_codec="aac")
+                    st.video(out_path)
+                    with open(out_path, "rb") as f:
+                        btn_data = f.read()
+                    st.download_button("Download Promo Clip", data=btn_data, file_name="promo_clip.mp4", mime="video/mp4")
+        else:
+            st.info("Select scenes in the 'Semantic Search' tab to enable promo creation.")
+
+
+        ## displaying full scene summary
+    with tab6:
+        st.header("Generate Full Video Summary")
+        if not st.session_state.get('scene_records'):
+            st.info("Please process scenes first (" +
+                    "click '1️⃣ Process Scenes' in the sidebar).")
+        else:
+            if st.button("🔄 Summarize Full Video"):
+                # Extract scene summaries
+                scene_summaries = [r['summary'] for r in st.session_state['scene_records']]
+                # Step 1: Gemini chunk summarization
+                chunk_summaries = summarize_chunks_with_gemini(scene_summaries)
+                # Step 2: OpenAI final summary
+                full_summary = final_summary_with_openai(chunk_summaries)
+                st.subheader("Full Video Summary")
+                st.write(full_summary)
+    
+
+    # Cleanup
+    st.button("🧹 Clear All", on_click=lambda: [
+        shutil.rmtree(temp_dir, ignore_errors=True),
+        st.session_state.clear()
+    ])
