@@ -10,10 +10,12 @@ import boto3
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 import json
-
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
-# --- Configuration & Clients ---
+
+
+# Configuration & Clients Setup
 # Google Cloud Setup
 google_credentials = st.secrets["google_cloud"]
 credentials_dict = {
@@ -34,7 +36,10 @@ with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as tem
     temp_file_path = temp_file.name
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file_path
 
-# Initialize Clients
+
+
+
+# Initializing Clients
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
 speech_client = speech.SpeechClient()
@@ -49,7 +54,7 @@ rekognition = boto3.client(
 
 
 
-
+# Setting up pinecone
 pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 
 if "video-highlights" not in pc.list_indexes().names():
@@ -66,20 +71,23 @@ index = pc.Index("video-highlights")
 
 
 
-# Templated.io Config
+# Setting up Templated.io 
 TEMPLATED_API_URL = "https://api.templated.io/v1/renders"
 TEMPLATED_API_KEY = st.secrets["TEMPLATED_API_KEY"]
 TEMPLATED_TEMPLATE_ID = st.secrets["TEMPLATED_TEMPLATE_ID"]
 
+#Webapp title
 st.title("🎬 AI Video Analyzer")
 
-# --- Helper Functions ---
+# Defining Helper Functions
+# Function for extracting video duration 
 def get_video_duration(path):
     clip = VideoFileClip(path)
     duration = clip.duration
     clip.close()
     return duration
 
+# Saving video in temp dir
 def save_temp_video(uploaded):
     temp_dir = tempfile.mkdtemp()
     path = os.path.join(temp_dir, uploaded.name)
@@ -88,7 +96,7 @@ def save_temp_video(uploaded):
     return path, temp_dir
 
 
-
+# Function for transcribing the video in chunks (spiliting video under 60sec)
 def transcribe(path, chunk_length=59, overlap=0.5):
     """
     Splits audio into overlapping chunks, transcribes each in multiple languages,
@@ -137,13 +145,13 @@ def transcribe(path, chunk_length=59, overlap=0.5):
             start += chunk_length - overlap
             time.sleep(0.2)
 
-    # filter out empty
+    # filter out empty chunks
     segments = [s for s in transcripts if s["text"]]
     full_text = " ".join(s["text"] for s in segments)
     return full_text, segments
 
 
-
+# Breaking vide in frames and analysing frames
 def analyze_frame(image_bytes):
     labels = []
     try:
@@ -165,7 +173,7 @@ def analyze_frame(image_bytes):
     
     return list(dict.fromkeys(labels))[:20]
 
-
+# For scene detection and  generating summaries of scenes 
 def enrich_shots(path, transcript_segments):
     """
     Detects shot changes, analyzes frames, and generates LLM summaries including
@@ -230,7 +238,7 @@ def enrich_shots(path, transcript_segments):
     return records
 
 
-
+# Saving each frame
 def save_frame(path, t, outp):
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -241,6 +249,7 @@ def save_frame(path, t, outp):
     cap.release()
     return outp
 
+# Indexing scenes on pinecone
 def index_scenes(scenes):
     vectors = []
     for i, scene in enumerate(scenes):
@@ -249,7 +258,7 @@ def index_scenes(scenes):
         vectors.append((str(i), emb.data[0].embedding, scene))
     index.upsert(vectors=vectors)
 
-
+# generating Scene summaries in chunks
 def summarize_chunks_with_gpt4(client, summaries, chunk_size=5):
     chunk_summaries = []
 
@@ -285,7 +294,7 @@ def summarize_chunks_with_gpt4(client, summaries, chunk_size=5):
     return chunk_summaries
 
 
-### final full summary 
+# Generating final full summary 
 def final_summary_with_openai(chunk_summaries , full_text):
     system_msg = "You are a professional video summarization expert. "
     user_msg = (
@@ -311,8 +320,36 @@ def final_summary_with_openai(chunk_summaries , full_text):
     )
     return resp.choices[0].message.content.strip()
 
+# for extracting the main agenda for banner title
+def extract_key_line(transcript: str, summary: str, client) -> str:
+    """
+    Ask the LLM to return the single most important line (agenda) in the video,
+    by looking at both the full transcript and the full summary.
+    Output must be exactly one line.
+    """
+    combined = (
+        "Transcript:\n" + transcript + "\n\n" +
+        "Summary:\n" + summary
+    )
+    prompt = (
+        "Given the full video transcript and a concise summary, identify the single most important headline or agenda line that captures the video's core message. "
+        "Output exactly one line.\n\n" + combined
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4-turbo",
+        messages=[
+            {"role": "system", "content": "You are a video summarization expert that provides a single headline line."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.0,
+        max_tokens=50
+    )
+    # ensure single line
+    return resp.choices[0].message.content.strip().splitlines()[0]
 
 
+
+# for searching the best match for prompt
 def semantic_search(prompt, top_k=3):
     emb = client.embeddings.create(input=[prompt], model="text-embedding-ada-002")
     return index.query(
@@ -321,6 +358,7 @@ def semantic_search(prompt, top_k=3):
         include_metadata=True
     )
 
+# function for better scene index management
 def index_scenes(scenes):
     # delete any old vectors so IDs always line up 0…len(scenes)-1
     index.delete(delete_all=True)
@@ -331,23 +369,41 @@ def index_scenes(scenes):
         vectors.append((str(i), emb.data[0].embedding, scene))
     index.upsert(vectors=vectors)
 
-def create_templated_thumbnail(frame_path, title, summary):
-    with open(frame_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-    
-    payload = {
-        "template_id": TEMPLATED_TEMPLATE_ID,
-        "modifications": {
-            "title": {"text": title},
-            "summary": {"text": summary},
-            "image": {"image_data": img_b64}
-        }
-    }
-    headers = {"Authorization": f"Bearer {TEMPLATED_API_KEY}"}
-    resp = requests.post(TEMPLATED_API_URL, json=payload, headers=headers)
-    return resp.json().get("url")
+# Image processing utilities
+def image_to_base64(file_path):
+    with open(file_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
-# --- UI Flow ---
+# validating image path
+def is_valid_image(file_path):
+    try:
+        Image.open(file_path)
+        return True
+    except Exception:
+        return False
+
+# Resizing image
+def resize_image(input_path, output_path, size=(846, 541)):
+    with Image.open(input_path) as img:
+        img = img.resize(size)
+        img.save(output_path)
+
+
+
+#  Configuration for thumbnail
+DEFAULT_FONT = "arial.ttf"  
+TITLE_FONT_SIZE = 60
+SUBTITLE_FONT_SIZE = 40
+LOGO_SIZE = (80, 80)
+PADDING = 30
+BAR_HEIGHT = 120
+BAR_COLOR = (0, 123, 255, 200)  
+TEXT_COLOR = (255, 255, 255, 255)
+SHADOW_COLOR = (0, 0, 0, 150)
+
+
+
+# Webapp UI Flow 
 st.session_state.setdefault("uploaded", None)
 st.session_state.setdefault("transcript", "")
 st.session_state.setdefault("chunk_transcripts", [])
@@ -377,7 +433,7 @@ if uploaded:
     if duration > 240:  # 4 minutes
         st.warning("Note: Full analysis limited to first 4 minutes for free tier services")
 
-    # --- Processing Buttons ---
+    # Processing Buttons 
     col1, col2 = st.columns(2)
     with col1:
         
@@ -391,15 +447,15 @@ if uploaded:
                 st.success(f"Generated {len(shots)} scene records.")
 
 
-    # Modify the tab setup
+    # Defining tab setup
     tab0, tab1, tab6, tab2, tab5, tab3, tab4,  = st.tabs([
         "Transcription" , "Scene Breakdown", "Full video summary", "Semantic Search", 
-        "Promo Clip", "Banner Creator",  "Raw Content" 
+        "Promo Clip", "Banner Creator",  "Download metadata" 
     ])
 
     st.session_state.setdefault("selected_scenes", [])
 
-
+    # tab0 for displaying transcript
     with tab0:
         st.header("Full Transcript")
         if st.session_state.transcript:
@@ -419,7 +475,7 @@ if uploaded:
     
 
 
-
+    # tab1 for scene summaries 
     with tab1:  # Scene Breakdown
         if st.session_state.scenes:
             st.subheader("📽️ Scene Analysis")
@@ -482,60 +538,88 @@ if uploaded:
                     st.write(f"**Labels:** {', '.join(scene['labels'][:10])}")
 
 
-    with tab3:  # Banner Creator
-
-        if st.button("🤖 Auto-Generate Banner"):
-            scenes = st.session_state.scenes
+    # tab 3 for banner generation
+    with tab3:
+        if st.button("🤖 Generate Modern Banner"):
+            # Preconditions: scenes + text
+            scenes = st.session_state.get('scenes', [])
             if not scenes:
                 st.error("⚠️ Run Scene Analysis first!")
-            else:
-                # 1) semantic search for “best” scene, get 3 so we can filter
-                results = semantic_search(
-                    "Which scene is the most engaging for a social-media banner?",
-                    top_k=3
-                )
-                matches = results.get("matches", [])
-                
-                # 2) drop any match whose ID is outside 0…len(scenes)-1
-                valid = [
-                    m for m in matches
-                    if m.get("id", "").isdigit()
-                    and 0 <= int(m["id"]) < len(scenes)
-                ]
-                if not valid:
-                    st.error("😕 No valid scene found—try re-analyzing or tweak the prompt.")
+                st.stop()
+
+            transcript = st.session_state.get('full_text', '')
+            full_sum = st.session_state.get('full_summary')
+            if not full_sum:
+                sums = [r['summary'] for r in st.session_state.get('scene_records', [])]
+                full_sum = final_summary_with_openai(sums, transcript)
+                st.session_state['full_summary'] = full_sum
+            banner_title = extract_key_line(transcript, full_sum, client)
+            st.write(banner_title)
+            title_font_size = str(max(24, 60 - len(banner_title)//3)) + "px"
+
+            # Select best video frame
+            res = semantic_search(banner_title, top_k=3)
+            valid = [m for m in res.get('matches', []) if m.get('id', '').isdigit()]
+            if not valid:
+                st.error("No valid scene—re-run analysis.")
+                st.stop()
+            scene = scenes[int(valid[0]['id'])]
+
+            # Extract, resize and validate frame image
+            frame_path = save_frame(st.session_state.uploaded, scene['start'], 'auto_frame.jpg')
+            st.write(frame_path)
+            resized_path = 'resized_frame.jpg'
+            resize_image(frame_path, resized_path, size=(846, 541))
+            if not (is_valid_image(resized_path) and os.path.getsize(resized_path) <= 5 * 1024 * 1024):
+                st.error("Invalid or too-large resized frame image")
+                st.stop()
+            bg_data = image_to_base64(resized_path)
+
+            # Prepare API credentials
+            api_key = st.secrets['TEMPLATED_API_KEY']
+            template_id = st.secrets['TEMPLATED_TEMPLATE_ID']
+            url = 'https://api.templated.io/v1/render'
+            headers = {'Authorization': f'Bearer {api_key}'}
+
+            data = {
+                'template': template_id,
+                'layers': {
+                    'shape-2': {},
+                    'image-2': {
+                        'image_url': f'data:image/jpeg;base64,{bg_data}',
+                        'width': 846,
+                        'height': 541,
+                    },
+                    'shape-1': {},
+                    'text-3': {
+                        'text': banner_title,
+                        'color': '#2f4f4f',
+                        'text_align': 'center',
+                        'vertical_align': 'middle'
+                    }
+                }
+            }
+
+            # Send render request
+            resp = requests.post(url, json=data, headers=headers)
+            if resp.status_code == 200:
+                out = resp.json()
+                if 'url' in out:
+                    st.image(out['url'], caption=banner_title)
+                    st.markdown(f"[⬇ Download Banner]({out['url']})", unsafe_allow_html=True)
                 else:
-                    # 3) pick top‐scoring valid match
-                    best = valid[0]
-                    idx = int(best["id"])
-                    scene = scenes[idx]
-
-                    # 4) generate a 3–5 word title
-                    prompt = f"Create a catchy 3–5 word title for this scene: {scene['summary']}"
-                    resp = client.chat.completions.create(
-                        model="gpt-4",
-                        messages=[{"role":"user","content":prompt}],
-                        temperature=0.7
-                    )
-                    title = resp.choices[0].message.content.strip()
-
-                    # 5) grab the key frame
-                    frame = save_frame(st.session_state.uploaded, scene["start"], "auto_frame.jpg")
-
-                    # 6) call templated.io to build the banner
-                    thumb_url = create_templated_thumbnail(frame, title, scene["summary"])
-
-                    # 7) display & download
-                    st.image(thumb_url, caption=title)
-                    st.download_button(
-                        "Download Banner",
-                        data=requests.get(thumb_url).content,
-                        file_name="banner.jpg",
-                        mime="image/jpeg"
-                    )
+                    st.error("Missing image URL in response")
+                    st.json(out)
+            else:
+                st.error(f"Render failed ({resp.status_code})")
+                st.code(resp.text)
 
 
-    with tab4:  # Raw Content
+
+
+
+    # For downloading json file
+    with tab4:  
         # Always read from persisted scene_records to avoid rerun clearing scenes
         if st.session_state.get('scene_records'):
             json_data = json.dumps(st.session_state['scene_records'], indent=2)
@@ -550,7 +634,7 @@ if uploaded:
             st.info("No scene records available. Analyze scenes first.")
 
 
-    # New Promo Clip tab
+    # For promo generation
     with tab5:
         if st.session_state.selected_scenes:
             st.subheader("🎥 Compile Selected Scenes into Promo")
@@ -572,7 +656,7 @@ if uploaded:
             st.info("Select scenes in the 'Semantic Search' tab to enable promo creation.")
 
 
-        ## displaying full scene summary
+    # displaying full scene summary
     with tab6:
         st.header("Generate Full Video Summary")
         if not st.session_state.get('scene_records'):
