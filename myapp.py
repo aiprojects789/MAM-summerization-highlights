@@ -554,7 +554,7 @@ if uploaded:
                 full_sum = final_summary_with_openai(sums, transcript)
                 st.session_state['full_summary'] = full_sum
             banner_title = extract_key_line(transcript, full_sum, client)
-            st.write(banner_title)
+            #st.write(banner_title)
             title_font_size = str(max(24, 60 - len(banner_title)//3)) + "px"
 
             # Select best video frame
@@ -567,7 +567,7 @@ if uploaded:
 
             # Extract, resize and validate frame image
             frame_path = save_frame(st.session_state.uploaded, scene['start'], 'auto_frame.jpg')
-            st.write(frame_path)
+            #st.write(frame_path)
             resized_path = 'resized_frame.jpg'
             resize_image(frame_path, resized_path, size=(846, 541))
             if not (is_valid_image(resized_path) and os.path.getsize(resized_path) <= 5 * 1024 * 1024):
