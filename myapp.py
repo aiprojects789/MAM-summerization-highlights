@@ -212,10 +212,22 @@ def enrich_shots(path, transcript_segments):
                 model="gpt-4-turbo",
                 messages=[
                     {"role": "system", "content": (
-                        "Summarize this video scene considering visual elements, "
-                        "possible activities, emotions, and context. Use the transcript to enrich accuracy."
+                        """You are a professional video‐scene summarization engine. For each shot, generate a clear, 120–150-word paragraph that:
+
+                        Names any people, characters, or figures you can identify (and their roles, if known).
+
+                        Describes the key visual elements and setting.
+
+                        Summarizes any actions or interactions.
+
+                        Captures the emotional tone or atmosphere.
+
+                        References any spoken text when relevant.
+
+                        Write in a neutral, reportorial style—concise but vivid. Avoid filler or speculation beyond what’s visible."""
                     )},
                     {"role": "user", "content": (
+                        f"Shot start–end: {start}s–{end}s\n"
                         f"Detected elements: {', '.join(labels)}\n"
                         f"Transcript excerpt: {scene_text if scene_text else '[No speech]'}"
                     )}
