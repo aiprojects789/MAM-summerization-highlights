@@ -212,6 +212,8 @@ def enrich_shots(path, transcript_segments):
                 model="gpt-4-turbo",
                 messages=[
                     {"role": "system", "content": (
+                        # "Summarize this video scene considering visual elements, "
+                        # "possible activities, emotions, and context. Use the transcript to enrich accuracy."
                         """You are a professional video‐scene summarization engine. For each shot, generate a clear, 120–150-word paragraph that:
 
                         Names any people, characters, or figures you can identify (and their roles, if known).
@@ -233,6 +235,7 @@ def enrich_shots(path, transcript_segments):
                     )}
                 ],
                 temperature=0.7,
+                # max_tokens=150
                 max_tokens=300
             )
             summary = resp.choices[0].message.content.strip()
