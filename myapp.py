@@ -16,59 +16,76 @@ from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
 
 # Configuration & Clients Setup
-# Google Cloud Setup
-google_credentials = st.secrets["google_cloud"]
-credentials_dict = {
-    "type": "service_account",
-    "project_id": google_credentials["project_id"],
-    "private_key_id": google_credentials["private_key_id"],
-    "private_key": google_credentials["private_key"].replace('\\n', '\n'),
-    "client_email": google_credentials["client_email"],
-    "client_id": google_credentials["client_id"],
-    "auth_uri": google_credentials["auth_uri"],
-    "token_uri": google_credentials["token_uri"],
-    "auth_provider_x509_cert_url": google_credentials["auth_provider_x509_cert_url"],
-    "client_x509_cert_url": google_credentials["client_x509_cert_url"]
-}
+OFFLINE = os.getenv("OFFLINE_MODE", "0") == "1"
 
-with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as temp_file:
-    json.dump(credentials_dict, temp_file)
-    temp_file_path = temp_file.name
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file_path
+# Google Cloud Setup (only if online)
+if not OFFLINE:
+    google_credentials = st.secrets.get("google_cloud", {})
+    credentials_dict = {
+        "type": "service_account",
+        "project_id": google_credentials.get("project_id", ""),
+        "private_key_id": google_credentials.get("private_key_id", ""),
+        "private_key": google_credentials.get("private_key", "").replace('\\n', '\n'),
+        "client_email": google_credentials.get("client_email", ""),
+        "client_id": google_credentials.get("client_id", ""),
+        "auth_uri": google_credentials.get("auth_uri", ""),
+        "token_uri": google_credentials.get("token_uri", ""),
+        "auth_provider_x509_cert_url": google_credentials.get("auth_provider_x509_cert_url", ""),
+        "client_x509_cert_url": google_credentials.get("client_x509_cert_url", "")
+    }
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".json") as temp_file:
+        json.dump(credentials_dict, temp_file)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_file.name
 
+# Initialize external clients with offline fallback
+client = None
+speech_client = None
+vi_client = None
+vision_client = None
+rekognition = None
+index = None
 
+if not OFFLINE:
+    try:
+        client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+    except Exception:
+        client = None
 
+    try:
+        genai.configure(api_key=st.secrets.get("GOOGLE_API_KEY", ""))
+    except Exception:
+        pass
 
-# Initializing Clients
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-speech_client = speech.SpeechClient()
-vi_client = vi.VideoIntelligenceServiceClient()
-vision_client = vision.ImageAnnotatorClient()
-rekognition = boto3.client(
-    'rekognition',
-    aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
-    aws_secret_access_key=st.secrets["AWS_SECRET_KEY"],
-    region_name="us-east-1"
-)
+    try:
+        speech_client = speech.SpeechClient()
+        vi_client = vi.VideoIntelligenceServiceClient()
+        vision_client = vision.ImageAnnotatorClient()
+    except Exception:
+        speech_client = vi_client = vision_client = None
 
+    try:
+        rekognition = boto3.client(
+            'rekognition',
+            aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY", ""),
+            aws_secret_access_key=st.secrets.get("AWS_SECRET_KEY", ""),
+            region_name="us-east-1"
+        )
+    except Exception:
+        rekognition = None
 
-
-# Setting up pinecone
-pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
-
-if "video-highlights" not in pc.list_indexes().names():
-    pc.create_index(
-        name="video-highlights",
-        dimension=1536,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-    )
-
-index = pc.Index("video-highlights")
-
-
-
+    # Pinecone
+    try:
+        pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
+        if "video-highlights" not in pc.list_indexes().names():
+            pc.create_index(
+                name="video-highlights",
+                dimension=1536,
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+        index = pc.Index("video-highlights")
+    except Exception:
+        index = None
 
 
 # Setting up Templated.io 
@@ -76,8 +93,41 @@ TEMPLATED_API_URL = "https://api.templated.io/v1/renders"
 TEMPLATED_API_KEY = st.secrets["TEMPLATED_API_KEY"]
 TEMPLATED_TEMPLATE_ID = st.secrets["TEMPLATED_TEMPLATE_ID"]
 
+# Making local dir
+# Transcript
+TRANSCRIPT_DIR = "transcripts"
+os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+
+#Scenes 
+SCENE_DIR = "scenes"
+os.makedirs(SCENE_DIR, exist_ok=True)
+
+# full summary 
+SUMMARY_DIR = "full_summaries"
+os.makedirs(SUMMARY_DIR, exist_ok=True)
+
+# banner
+BANNER_DIR = "banner"
+os.makedirs(BANNER_DIR, exist_ok=True)
+
+# Promo
+PROMO_DIR = "promo"
+os.makedirs(PROMO_DIR, exist_ok=True)
+
+
 #Webapp title
 st.title("🎬 AI Video Analyzer")
+
+# Session defaults
+st.session_state.setdefault("uploaded", None)
+st.session_state.setdefault("transcript", "")
+st.session_state.setdefault("segments", [])
+st.session_state.setdefault("scenes", [])
+st.session_state.setdefault("scene_records", [])
+st.session_state.setdefault("selected_scenes", [])
+st.session_state.setdefault("banner_path", None)
+st.session_state.setdefault("promo_path", None)
+st.session_state.setdefault("full_summary", None)
 
 # Defining Helper Functions
 # Function for extracting video duration 
@@ -151,6 +201,32 @@ def transcribe(path, chunk_length=59, overlap=0.5):
     return full_text, segments
 
 
+# saving and loading transcript 
+# defining trancript path 
+def transcript_paths(video_path):
+    """Return the JSON path you’ll use to save/load this video’s transcript."""
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(TRANSCRIPT_DIR, f"{base}.json")
+
+# loading transcript
+def load_transcript(video_path):
+    """If we’ve already saved a transcript for this video, load and return it."""
+    p = transcript_paths(video_path)
+    if os.path.exists(p):
+        with open(p, "r") as f:
+            data = json.load(f)
+        return data["full"], data["segments"]
+    return None, None
+
+
+# saving trancript 
+def save_transcript(video_path, full, segments):
+    """Persist the full text and per-chunk segments as JSON."""
+    p = transcript_paths(video_path)
+    with open(p, "w") as f:
+        json.dump({"full": full, "segments": segments}, f, indent=2)
+
+
 # Breaking vide in frames and analysing frames
 def analyze_frame(image_bytes):
     labels = []
@@ -212,8 +288,7 @@ def enrich_shots(path, transcript_segments):
                 model="gpt-4-turbo",
                 messages=[
                     {"role": "system", "content": (
-                        # "Summarize this video scene considering visual elements, "
-                        # "possible activities, emotions, and context. Use the transcript to enrich accuracy."
+                        
                         """You are a professional video‐scene summarization engine. For each shot, generate a clear, 120–150-word paragraph that:
 
                         Names any people, characters, or figures you can identify (and their roles, if known).
@@ -272,6 +347,27 @@ def index_scenes(scenes):
         emb = client.embeddings.create(input=[text], model="text-embedding-ada-002")
         vectors.append((str(i), emb.data[0].embedding, scene))
     index.upsert(vectors=vectors)
+
+
+# loading and saving scenes
+def scene_path(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(SCENE_DIR, f"{base}.json")
+
+def load_scenes(video_path):
+    p = scene_path(video_path)
+    if os.path.exists(p):
+        with open(p, "r") as f:
+            return json.load(f)
+    return None
+
+def save_scenes(video_path, scenes):
+    p = scene_path(video_path)
+    with open(p, "w") as f:
+        json.dump(scenes, f, indent=2)
+
+
+
 
 # generating Scene summaries in chunks
 def summarize_chunks_with_gpt4(client, summaries, chunk_size=5):
@@ -334,6 +430,20 @@ def final_summary_with_openai(chunk_summaries , full_text):
         temperature=0.7
     )
     return resp.choices[0].message.content.strip()
+
+# loading and saving full summary
+def summary_path(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(SUMMARY_DIR, f"{base}.txt")
+
+def load_summary(video_path):
+    p = summary_path(video_path)
+    return open(p).read() if os.path.exists(p) else None
+
+def save_summary(video_path, text):
+    with open(summary_path(video_path), "w") as f:
+        f.write(text)
+
 
 # for extracting the main agenda for banner title
 def extract_key_line(transcript: str, summary: str, client) -> str:
@@ -404,6 +514,31 @@ def resize_image(input_path, output_path, size=(846, 541)):
         img.save(output_path)
 
 
+# Saving and loading promo clip
+def promo_path(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(PROMO_DIR, f"{base}_promo.mp4")
+
+def load_promo(video_path):
+    p = promo_path(video_path)
+    return p if os.path.exists(p) else None
+
+
+# Save and load banners
+def banner_path(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(BANNER_DIR, f"{base}.png")
+
+def load_banner(video_path):
+    p = banner_path(video_path)
+    return p if os.path.exists(p) else None
+
+def save_banner(video_path, img_bytes):
+    p = banner_path(video_path)
+    with open(p, "wb") as f:
+        f.write(img_bytes)
+
+
 
 #  Configuration for thumbnail
 DEFAULT_FONT = "arial.ttf"  
@@ -418,14 +553,6 @@ SHADOW_COLOR = (0, 0, 0, 150)
 
 
 
-# Webapp UI Flow 
-st.session_state.setdefault("uploaded", None)
-st.session_state.setdefault("transcript", "")
-st.session_state.setdefault("chunk_transcripts", [])
-st.session_state.setdefault("scenes", [])
-st.session_state.setdefault("video_title", "")
-
-
 if 'scene_records' not in st.session_state:
     st.session_state['scene_records'] = []
 
@@ -437,7 +564,14 @@ if uploaded:
     
 
     if st.button("1️⃣ Transcribe Video"):
-        full, segments = transcribe(st.session_state.uploaded)
+        full, segments = load_transcript(video_path)
+        if full is not None:
+            st.success("Loaded transcript from cache.")
+        else:
+            # full, segments = transcribe(st.session_state.uploaded)
+            full, segments = transcribe(video_path)
+            save_transcript(video_path, full, segments)
+            st.success("Transcription complete and saved.")
         st.session_state.transcript = full
         st.session_state.chunk_transcripts = segments
 
@@ -451,16 +585,21 @@ if uploaded:
     # Processing Buttons 
     col1, col2 = st.columns(2)
     with col1:
-        
         if st.button("✨ Analyze Scenes"):
             with st.spinner():
-                # transcript already in state
-                shots = enrich_shots(video_path, st.session_state.chunk_transcripts)
-                st.session_state.scenes = shots
-                index_scenes(shots)
-                st.session_state['scene_records'] = shots
-                st.success(f"Generated {len(shots)} scene records.")
-
+                # try cache first
+                cached = load_scenes(video_path)
+                if cached is not None:
+                    st.session_state.scenes = cached
+                    st.session_state.scene_records = cached
+                    st.success(f"Loaded {len(cached)} scenes from cache.")
+                else:
+                    shots = enrich_shots(video_path, st.session_state.chunk_transcripts)
+                    st.session_state.scenes = shots
+                    st.session_state.scene_records = shots
+                    save_scenes(video_path, shots)
+                    st.success(f"Analyzed and saved {len(shots)} scenes.")
+        
 
     # Defining tab setup
     tab0, tab1, tab6, tab2, tab5, tab3, tab4,  = st.tabs([
@@ -469,24 +608,24 @@ if uploaded:
     ])
 
     st.session_state.setdefault("selected_scenes", [])
+ 
 
-    # tab0 for displaying transcript
+
+
     with tab0:
         st.header("Full Transcript")
-        if st.session_state.transcript:
-        # if st.button("1️⃣ Transcribe Video"):
-            full_text, segments = transcribe(video_path)
-            st.session_state['full_text'] = full_text
-            st.session_state['chunk_transcripts'] = segments
-
-        if st.session_state.get('full_text'):
+       
+        if st.session_state.get('transcript'):
             st.text_area(
                 "Combined Transcript",
-                value=st.session_state['full_text'],
+                value=st.session_state['transcript'],
                 height=300
             )
         else:
             st.info("Click **1️⃣ Transcribe Video** first.")
+
+
+
     
 
 
@@ -514,6 +653,7 @@ if uploaded:
                             placeholder="e.g., 'emotional speech', 'action sequence', 'beautiful landscape'")
         
         if query and st.session_state.scenes:
+            index_scenes(st.session_state.scenes)
             results = semantic_search(query)
             st.subheader("Top Matching Scenes")
             
@@ -553,7 +693,7 @@ if uploaded:
                     st.write(f"**Labels:** {', '.join(scene['labels'][:10])}")
 
 
-    # tab 3 for banner generation
+
     with tab3:
         if st.button("🤖 Generate Modern Banner"):
             # Preconditions: scenes + text
@@ -562,17 +702,28 @@ if uploaded:
                 st.error("⚠️ Run Scene Analysis first!")
                 st.stop()
 
-            transcript = st.session_state.get('full_text', '')
+            # banner cache check
+            cached = load_banner(video_path)
+            if cached:
+                st.image(cached, caption="🎨 Cached Banner")
+                st.success("Loaded banner from cache.")
+                st.stop()
+
+            # ensure transcript & full summary
+            transcript = st.session_state.get('transcript', '')
             full_sum = st.session_state.get('full_summary')
             if not full_sum:
                 sums = [r['summary'] for r in st.session_state.get('scene_records', [])]
                 full_sum = final_summary_with_openai(sums, transcript)
+                # save_summary(video_path, full_sum)
                 st.session_state['full_summary'] = full_sum
+
+            # generate banner text
             banner_title = extract_key_line(transcript, full_sum, client)
-            #st.write(banner_title)
+            st.write(banner_title)
             title_font_size = str(max(24, 60 - len(banner_title)//3)) + "px"
 
-            # Select best video frame
+            # pick a representative frame
             res = semantic_search(banner_title, top_k=3)
             valid = [m for m in res.get('matches', []) if m.get('id', '').isdigit()]
             if not valid:
@@ -580,9 +731,8 @@ if uploaded:
                 st.stop()
             scene = scenes[int(valid[0]['id'])]
 
-            # Extract, resize and validate frame image
-            frame_path = save_frame(st.session_state.uploaded, scene['start'], 'auto_frame.jpg')
-            #st.write(frame_path)
+            # prepare background image
+            frame_path = save_frame(video_path, scene['start'], 'auto_frame.jpg')
             resized_path = 'resized_frame.jpg'
             resize_image(frame_path, resized_path, size=(846, 541))
             if not (is_valid_image(resized_path) and os.path.getsize(resized_path) <= 5 * 1024 * 1024):
@@ -590,12 +740,11 @@ if uploaded:
                 st.stop()
             bg_data = image_to_base64(resized_path)
 
-            # Prepare API credentials
+            # call Templated API
             api_key = st.secrets['TEMPLATED_API_KEY']
             template_id = st.secrets['TEMPLATED_TEMPLATE_ID']
             url = 'https://api.templated.io/v1/render'
             headers = {'Authorization': f'Bearer {api_key}'}
-
             data = {
                 'template': template_id,
                 'layers': {
@@ -615,21 +764,21 @@ if uploaded:
                 }
             }
 
-            # Send render request
             resp = requests.post(url, json=data, headers=headers)
             if resp.status_code == 200:
                 out = resp.json()
                 if 'url' in out:
-                    st.image(out['url'], caption=banner_title)
-                    st.markdown(f"[⬇ Download Banner]({out['url']})", unsafe_allow_html=True)
+                    # download, cache, and display
+                    img_bytes = requests.get(out['url']).content
+                    save_banner(video_path, img_bytes)
+                    st.image(img_bytes, caption=banner_title)
+                    st.download_button("⬇ Download Banner", img_bytes, "banner.png", "image/png")
                 else:
                     st.error("Missing image URL in response")
                     st.json(out)
             else:
                 st.error(f"Render failed ({resp.status_code})")
                 st.code(resp.text)
-
-
 
 
 
@@ -649,45 +798,66 @@ if uploaded:
             st.info("No scene records available. Analyze scenes first.")
 
 
-    # For promo generation
     with tab5:
-        if st.session_state.selected_scenes:
-            st.subheader("🎥 Compile Selected Scenes into Promo")
-            if st.button("Generate Promo"):
-                with st.spinner("Rendering promo clip..."):
-                    clips = []
-                    for idx in st.session_state.selected_scenes:
-                        scene = st.session_state.scenes[idx]
-                        clip = VideoFileClip(video_path).subclipped(scene['start'], scene['end'])
-                        clips.append(clip)
-                    promo = concatenate_videoclips(clips)
-                    out_path = os.path.join(temp_dir, "promo_clip.mp4")
-                    promo.write_videofile(out_path, codec="libx264", audio_codec="aac")
-                    st.video(out_path)
-                    with open(out_path, "rb") as f:
-                        btn_data = f.read()
-                    st.download_button("Download Promo Clip", data=btn_data, file_name="promo_clip.mp4", mime="video/mp4")
+        st.header("🎥 Promo Clip")
+        # First, check cache
+        cached = load_promo(st.session_state.uploaded)
+        if cached:
+            st.info("Loaded promo from cache.")
+            st.video(cached)
+            with open(cached, "rb") as f:
+                btn_data = f.read()
+            st.download_button("Download Cached Promo Clip", data=btn_data,
+                            file_name=os.path.basename(cached), mime="video/mp4")
         else:
-            st.info("Select scenes in the 'Semantic Search' tab to enable promo creation.")
+            if st.session_state.selected_scenes:
+                st.subheader("Compile Selected Scenes into Promo")
+                if st.button("Generate Promo", key="gen_promo"):
+                    with st.spinner("Rendering promo clip..."):
+                        clips = []
+                        for idx in st.session_state.selected_scenes:
+                            sc = st.session_state.scenes[idx]
+                            clips.append(VideoFileClip(st.session_state.uploaded).subclipped(sc['start'], sc['end']))
+                        promo = concatenate_videoclips(clips)
+                        out_path = promo_path(st.session_state.uploaded)
+                        promo.write_videofile(out_path, codec="libx264", audio_codec="aac")
+                        st.success("Promo generated and saved to cache.")
+                        st.video(out_path)
+                        with open(out_path, "rb") as f:
+                            btn_data = f.read()
+                        st.download_button("Download Promo Clip", data=btn_data,
+                                        file_name=os.path.basename(out_path), mime="video/mp4")
+            else:
+                st.info("Select scenes in the 'Semantic Search' tab to enable promo creation.")
 
 
-    # displaying full scene summary
     with tab6:
-        st.header("Generate Full Video Summary")
-        if not st.session_state.get('scene_records'):
-            st.info("Please process scenes first (" +
-                    "click '1️⃣ Process Scenes' in the sidebar).")
+        if st.session_state.get("full_summary"):
+            st.subheader("Full Video Summary")
+            st.write(st.session_state["full_summary"])
         else:
-            if st.button("🔄 Summarize Full Video"):
-                # Extract scene summaries
-                scene_summaries = [r['summary'] for r in st.session_state['scene_records']]
-                # Step 1: Gemini chunk summarization
-                chunk_summaries = summarize_chunks_with_gpt4(client , scene_summaries)
-                # Step 2: OpenAI final summary
-                full_summary = final_summary_with_openai(chunk_summaries , full_text)
-                st.subheader("Full Video Summary")
-                st.write(full_summary)
-    
+            if not st.session_state.get('scene_records'):
+                st.info("Please process scenes first.")
+            else:
+                st.header("Generate Full Video Summary")
+                if st.button("🔄 Summarize Full Video"):
+                    # try cache
+                    cached = load_summary(video_path)
+                    if cached:
+                        full_summary = cached
+                        st.success("Loaded summary from cache.")
+                    else:
+                        full_text = st.session_state.get("transcript", "")
+                        full_text = st.session_state.get("transcript", "")
+                        scene_summaries = [r["summary"] for r in st.session_state["scene_records"]]
+                        chunk_summaries = summarize_chunks_with_gpt4(client, scene_summaries)
+                        full_summary = final_summary_with_openai(chunk_summaries, full_text)
+                        save_summary(video_path, full_summary)
+                        st.success("Generated and saved summary.")
+                    st.session_state["full_summary"] = full_summary   # addded this one 
+                    st.subheader("Full Video Summary")
+                    st.write(full_summary)
+        
 
     # Cleanup
     st.button("🧹 Clear All", on_click=lambda: [
